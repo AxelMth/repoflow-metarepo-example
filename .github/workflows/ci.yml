@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install orchestrator dependencies
+        run: pnpm install
+
+      - name: Validate repoflow config
+        run: pnpm doctor
+
+      - name: Sync child repos
+        run: pnpm sync
+
+      - name: Install child dependencies
+        run: pnpm -r install
+
+      - name: Build all
+        run: pnpm build
+
+      - name: Test all
+        run: pnpm test

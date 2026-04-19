@@ -1,0 +1,26 @@
+{
+  "name": "repoflow-metarepo-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Meta-repository orchestrator for the repoflow Hello World example",
+  "author": "Axel Mathieu-Le Gall <axel@mathieu-legall.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/axelmth/repoflow-metarepo-example.git"
+  },
+  "scripts": {
+    "sync": "repoflow sync",
+    "status": "repoflow status",
+    "doctor": "repoflow doctor",
+    "dev": "bash scripts/dev.sh",
+    "build": "repoflow exec -- pnpm build",
+    "test": "repoflow exec -- pnpm test",
+    "lint": "repoflow exec -- pnpm lint"
+  },
+  "devDependencies": {
+    "@axelmth/repoflow": "^0.1.0",
+    "typescript": "^5.6.3"
+  }
+}
