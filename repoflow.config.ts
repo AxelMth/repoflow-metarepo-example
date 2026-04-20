@@ -1,4 +1,4 @@
-import { defineConfig } from '@axelmth/repoflow'
+import { defineConfig } from '@axelmth/repoflow-core'
 
 export default defineConfig({
   repos: [
