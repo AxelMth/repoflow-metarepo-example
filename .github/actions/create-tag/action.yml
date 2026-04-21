@@ -1,0 +1,186 @@
+name: Create tag
+description: Compute the next semver tag for the current repo based on its git history.
+
+inputs:
+  type:
+    description: "Tag strategy: prerelease | release | hotfix | hotfix-rc"
+    required: true
+  tag-prefix:
+    description: Prefix for all tags (default 'v')
+    required: false
+    default: v
+
+outputs:
+  tag:
+    description: Newly computed tag (e.g. v1.3.0-rc.2)
+    value: ${{ steps.compute.outputs.tag }}
+  prev_tag:
+    description: Previous tag used as comparison base (or 'none')
+    value: ${{ steps.compute.outputs.prev_tag }}
+  rc_tag:
+    description: RC tag used as source for a release (type=release only)
+    value: ${{ steps.compute.outputs.rc_tag }}
+  hotfix_tags:
+    description: Space-separated list of hotfix tags to verify on prereleases
+    value: ${{ steps.compute.outputs.hotfix_tags }}
+  base_prod_tag:
+    description: Clean release tag if prev_tag was a hotfix
+    value: ${{ steps.compute.outputs.base_prod_tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate input
+      shell: bash
+      run: |
+        case "${{ inputs.type }}" in
+          prerelease|release|hotfix|hotfix-rc) ;;
+          *) echo "::error::invalid type '${{ inputs.type }}' (expected prerelease|release|hotfix|hotfix-rc)"; exit 1 ;;
+        esac
+
+    - name: Fetch tags
+      shell: bash
+      run: git fetch --tags --force --quiet
+
+    - name: Compute tag
+      id: compute
+      shell: bash
+      env:
+        TAG_TYPE: ${{ inputs.type }}
+        PREFIX: ${{ inputs.tag-prefix }}
+      run: |
+        set -euo pipefail
+
+        # Regex helpers. All tags look like <prefix><major>.<minor>.<patch>[-rc.<n>]
+        PROD_RE="^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+$"
+        RC_RE="^${PREFIX}[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$"
+
+        # Sort tags by semver, newest first
+        all_tags() { git tag --sort=-v:refname; }
+        latest_prod() { all_tags | grep -E "$PROD_RE" | head -n1 || true; }
+        latest_rc()   { all_tags | grep -E "$RC_RE"   | head -n1 || true; }
+
+        # Split a tag "vX.Y.Z[-rc.N]" into MAJOR MINOR PATCH RC (RC=0 if none)
+        split_tag() {
+          local t="${1#${PREFIX}}"
+          local base="${t%%-rc.*}"
+          local rc="0"
+          if [[ "$t" == *-rc.* ]]; then rc="${t##*-rc.}"; fi
+          IFS=. read -r MAJ MIN PAT <<<"$base"
+          echo "$MAJ $MIN $PAT $rc"
+        }
+
+        # Compare two semver versions "A.B.C" vs "A.B.C". Returns 0 if $1 > $2
+        semver_gt() {
+          local a b
+          IFS=. read -r a b c <<<"$1"; local A=$a B=$b C=$c
+          IFS=. read -r a b c <<<"$2"; local D=$a E=$b F=$c
+          (( A != D )) && { (( A > D )); return; }
+          (( B != E )) && { (( B > E )); return; }
+          (( C > F ))
+        }
+
+        prev_prod="$(latest_prod)"
+        prev_rc="$(latest_rc)"
+        tag=""
+        prev_tag="none"
+        rc_tag=""
+        hotfix_tags=""
+        base_prod_tag=""
+
+        case "$TAG_TYPE" in
+          prerelease)
+            if [[ -z "$prev_prod" && -z "$prev_rc" ]]; then
+              # Bootstrap: no tags at all
+              tag="${PREFIX}0.1.0-rc.1"
+              prev_tag="none"
+            elif [[ -n "$prev_rc" ]]; then
+              # Is this RC still active (its base > last prod)?
+              read -r rMaj rMin rPat rN <<<"$(split_tag "$prev_rc")"
+              rc_base="$rMaj.$rMin.$rPat"
+              active=1
+              if [[ -n "$prev_prod" ]]; then
+                read -r pMaj pMin pPat _ <<<"$(split_tag "$prev_prod")"
+                prod_base="$pMaj.$pMin.$pPat"
+                if semver_gt "$prod_base" "$rc_base" || [[ "$prod_base" == "$rc_base" ]]; then
+                  active=0
+                fi
+              fi
+              if (( active )); then
+                # Bump RC number
+                tag="${PREFIX}${rc_base}-rc.$(( rN + 1 ))"
+                prev_tag="$prev_rc"
+              else
+                # Start a fresh RC from latest prod (minor+1)
+                read -r pMaj pMin pPat _ <<<"$(split_tag "$prev_prod")"
+                tag="${PREFIX}${pMaj}.$(( pMin + 1 )).0-rc.1"
+                prev_tag="$prev_prod"
+              fi
+            else
+              # Have prod, no RC → new series minor+1
+              read -r pMaj pMin pPat _ <<<"$(split_tag "$prev_prod")"
+              tag="${PREFIX}${pMaj}.$(( pMin + 1 )).0-rc.1"
+              prev_tag="$prev_prod"
+            fi
+
+            # Collect hotfix tags between prev_tag (if prod) and now that need cherry-verification
+            if [[ "$prev_tag" != none && "$prev_tag" =~ $PROD_RE ]]; then
+              base_prod_tag="$prev_tag"
+              hotfix_tags=$(all_tags | grep -E "$PROD_RE" | awk -v p="$prev_tag" '$0 > p' | tr '\n' ' ' | sed 's/ $//')
+            fi
+            ;;
+
+          release)
+            if [[ -z "$prev_rc" ]]; then
+              echo "::error::no RC tag found — cannot compute a release"; exit 1
+            fi
+            read -r rMaj rMin rPat _ <<<"$(split_tag "$prev_rc")"
+            tag="${PREFIX}${rMaj}.${rMin}.${rPat}"
+            rc_tag="$prev_rc"
+            prev_tag="${prev_prod:-none}"
+            ;;
+
+          hotfix)
+            if [[ -z "$prev_prod" ]]; then
+              echo "::error::no production tag found — cannot compute a hotfix"; exit 1
+            fi
+            read -r pMaj pMin pPat _ <<<"$(split_tag "$prev_prod")"
+            tag="${PREFIX}${pMaj}.${pMin}.$(( pPat + 1 ))"
+            prev_tag="$prev_prod"
+            ;;
+
+          hotfix-rc)
+            if [[ -z "$prev_prod" ]]; then
+              echo "::error::no production tag found — cannot compute a hotfix-rc"; exit 1
+            fi
+            read -r pMaj pMin pPat _ <<<"$(split_tag "$prev_prod")"
+            prod_base="$pMaj.$pMin.$pPat"
+            if [[ -n "$prev_rc" ]]; then
+              read -r rMaj rMin rPat rN <<<"$(split_tag "$prev_rc")"
+              rc_base="$rMaj.$rMin.$rPat"
+              if [[ "$rc_base" == "$prod_base" ]]; then
+                echo "::error::RC $prev_rc already released as $prev_prod"; exit 1
+              fi
+              if semver_gt "$rc_base" "$prod_base"; then
+                # Active RC series → bump RC number
+                tag="${PREFIX}${rc_base}-rc.$(( rN + 1 ))"
+                prev_tag="$prev_rc"
+              else
+                # RC is outdated → start fresh patch RC from prod
+                tag="${PREFIX}${pMaj}.${pMin}.$(( pPat + 1 ))-rc.1"
+                prev_tag="$prev_prod"
+              fi
+            else
+              tag="${PREFIX}${pMaj}.${pMin}.$(( pPat + 1 ))-rc.1"
+              prev_tag="$prev_prod"
+            fi
+            ;;
+        esac
+
+        echo "tag=$tag"                   >> "$GITHUB_OUTPUT"
+        echo "prev_tag=$prev_tag"         >> "$GITHUB_OUTPUT"
+        echo "rc_tag=$rc_tag"             >> "$GITHUB_OUTPUT"
+        echo "hotfix_tags=$hotfix_tags"   >> "$GITHUB_OUTPUT"
+        echo "base_prod_tag=$base_prod_tag" >> "$GITHUB_OUTPUT"
+
+        echo "::notice title=create-tag::type=$TAG_TYPE tag=$tag prev=$prev_tag rc=$rc_tag hotfixes='$hotfix_tags'"

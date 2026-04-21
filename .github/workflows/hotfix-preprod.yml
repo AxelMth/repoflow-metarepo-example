@@ -1,0 +1,229 @@
+name: Hotfix preprod
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: Target repo name (must match repoflow.config.ts)
+        required: true
+      commit:
+        description: Commit SHA to cherry-pick
+        required: true
+      dry-run:
+        description: Simulate without pushing tags or notifying Slack
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: hotfix-preprod-${{ github.event.inputs.repo }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  resolve:
+    name: Resolve target repo
+    runs-on: ubuntu-latest
+    outputs:
+      fullName: ${{ steps.lookup.outputs.fullName }}
+      workflow: ${{ steps.lookup.outputs.workflow }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+
+      - name: Install orchestrator dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Look up repo in repoflow config
+        id: lookup
+        env:
+          REPO_NAME: ${{ github.event.inputs.repo }}
+        run: |
+          set -euo pipefail
+          pnpm --silent repoflow list --json > /tmp/repos.json
+          REPO_NAME="$REPO_NAME" node --input-type=module - <<'JS' > /tmp/lookup.json
+          import fs from 'node:fs'
+          const all = JSON.parse(fs.readFileSync('/tmp/repos.json', 'utf8'))
+          const name = process.env.REPO_NAME
+          const hit = all.find(r => r.name === name)
+          if (!hit) { console.error(`unknown repo: ${name}`); process.exit(1) }
+          if (!hit.preprodWorkflow) { console.error(`repo ${name} has no preprodWorkflow configured`); process.exit(1) }
+          const m = /github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?/.exec(hit.url)
+          if (!m) { console.error(`cannot parse owner/repo from ${hit.url}`); process.exit(1) }
+          process.stdout.write(JSON.stringify({ fullName: m[1], workflow: hit.preprodWorkflow }))
+          JS
+          fullName=$(jq -r '.fullName' /tmp/lookup.json)
+          workflow=$(jq -r '.workflow' /tmp/lookup.json)
+          echo "fullName=$fullName" >> "$GITHUB_OUTPUT"
+          echo "workflow=$workflow" >> "$GITHUB_OUTPUT"
+
+  fix:
+    name: Cherry-pick & tag
+    needs: resolve
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      prev_tag: ${{ steps.tag.outputs.prev_tag }}
+      commit_hash: ${{ steps.push.outputs.commit_hash }}
+      tag_pushed_at: ${{ steps.push.outputs.tag_pushed_at }}
+      skipped: ${{ steps.push.outputs.skipped }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.resolve.outputs.fullName }}
+          token: ${{ secrets.GIT_PAT_PULL }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Checkout meta-repo (sparse)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          path: .meta
+          sparse-checkout: |
+            .github/actions
+            scripts
+
+      - name: Inject shared actions
+        run: |
+          mkdir -p .github/actions
+          cp -R .meta/.github/actions/. .github/actions/
+          mkdir -p scripts
+          cp -R .meta/scripts/. scripts/
+
+      - name: Restore target package.json
+        run: git checkout -- package.json 2>/dev/null || true
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute hotfix-rc tag
+        id: tag
+        uses: ./.github/actions/create-tag
+        with:
+          type: hotfix-rc
+
+      - name: Create branch & cherry-pick
+        id: cherry
+        env:
+          PREV_TAG: ${{ steps.tag.outputs.prev_tag }}
+          NEW_TAG: ${{ steps.tag.outputs.tag }}
+          COMMIT: ${{ github.event.inputs.commit }}
+        run: |
+          set -euo pipefail
+          branch="rc/${NEW_TAG}"
+          git checkout -b "$branch" "$PREV_TAG"
+
+          if git merge-base --is-ancestor "$COMMIT" HEAD 2>/dev/null; then
+            echo "::notice::commit $COMMIT already present in $PREV_TAG — nothing to cherry-pick"
+            echo "already_present=true" >> "$GITHUB_OUTPUT"
+          else
+            # -x adds the "(cherry picked from ...)" trailer so we can trace it later
+            git cherry-pick -x "$COMMIT"
+            echo "already_present=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Push tag & create prerelease
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GIT_PAT_PULL }}
+          NEW_TAG: ${{ steps.tag.outputs.tag }}
+          PREV_TAG: ${{ steps.tag.outputs.prev_tag }}
+          REPO: ${{ needs.resolve.outputs.fullName }}
+          DRY_RUN: ${{ github.event.inputs.dry-run || 'false' }}
+          BRANCH: ${{ steps.cherry.outputs.branch }}
+        run: |
+          set -euo pipefail
+          pushed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          commit=$(git rev-parse HEAD)
+
+          notes=$(git log --no-merges --pretty=format:'- %s (%h)' "${PREV_TAG}..HEAD" | head -n 50 || true)
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "::notice::[dry-run] would push $BRANCH + tag $NEW_TAG and create a prerelease"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          else
+            git push origin "$BRANCH"
+            git tag -a "$NEW_TAG" -m "Hotfix prerelease $NEW_TAG"
+            git push origin "refs/tags/$NEW_TAG"
+            gh release create "$NEW_TAG" \
+              --repo "$REPO" \
+              --title "$NEW_TAG" \
+              --notes "$notes" \
+              --prerelease \
+              --target "$commit"
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "commit_hash=$commit" >> "$GITHUB_OUTPUT"
+          echo "tag_pushed_at=$pushed_at" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack
+        if: ${{ github.event.inputs.dry-run != 'true' }}
+        uses: ./.github/actions/notify-slack
+        with:
+          slack-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel-id: ${{ secrets.SLACK_CHANGELOG_CHANNEL_ID }}
+          title: "🚑 Hotfix preprod ${{ steps.tag.outputs.tag }}"
+          body: |
+            *${{ needs.resolve.outputs.fullName }}* → `${{ steps.tag.outputs.tag }}`
+            Cherry-picked: `${{ github.event.inputs.commit }}`
+            Previous: `${{ steps.tag.outputs.prev_tag }}`
+          url: https://github.com/${{ needs.resolve.outputs.fullName }}/releases/tag/${{ steps.tag.outputs.tag }}
+
+  wait-for-deployments:
+    name: Wait for deployment
+    needs: [resolve, fix]
+    if: ${{ github.event.inputs.dry-run != 'true' && needs.fix.outputs.skipped != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait
+        env:
+          GH_TOKEN: ${{ secrets.GIT_PAT }}
+          REPO: ${{ needs.resolve.outputs.fullName }}
+          WORKFLOW: ${{ needs.resolve.outputs.workflow }}
+          TAG: ${{ needs.fix.outputs.tag }}
+          SHA: ${{ needs.fix.outputs.commit_hash }}
+          PUSHED_AT: ${{ needs.fix.outputs.tag_pushed_at }}
+        run: |
+          payload=$(jq -nc \
+            --arg repo "$REPO" \
+            --arg tag "$TAG" \
+            --arg wf "$WORKFLOW" \
+            --arg sha "$SHA" \
+            --arg pushed "$PUSHED_AT" \
+            '[{repo:$repo, tag:$tag, workflow:$wf, commitSha:$sha, tagPushedAt:$pushed}]')
+          bash scripts/wait-for-workflows.sh "$payload"
+
+  changelog:
+    name: Changelog
+    needs: [resolve, fix]
+    if: ${{ github.event.inputs.dry-run != 'true' && needs.fix.outputs.skipped != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/notify-slack
+        with:
+          slack-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          channel-id: ${{ secrets.SLACK_CHANGELOG_CHANNEL_ID }}
+          title: "🚑 Hotfix RC disponible"
+          body: |
+            *${{ needs.resolve.outputs.fullName }}* → `${{ needs.fix.outputs.tag }}`
+            Commit: `${{ needs.fix.outputs.commit_hash }}`
+          url: https://github.com/${{ needs.resolve.outputs.fullName }}/releases/tag/${{ needs.fix.outputs.tag }}

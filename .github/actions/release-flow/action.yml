@@ -1,0 +1,203 @@
+name: Release flow
+description: Compute a tag, push it (or draft a release), and notify Slack. Called by prerelease and release workflows.
+
+inputs:
+  type:
+    description: "prerelease | release"
+    required: true
+  repository:
+    description: Full repo name 'owner/repo' (for release URLs and API)
+    required: true
+  github-token:
+    description: PAT with repo scope
+    required: true
+  slack-token:
+    description: Slack bot token
+    required: true
+  channel-id:
+    description: Slack channel ID for notifications
+    required: true
+  dry-run:
+    description: Simulate without pushing/creating/posting
+    required: false
+    default: "false"
+
+outputs:
+  tag:
+    description: Computed tag (or would-be tag in dry-run)
+    value: ${{ steps.finalize.outputs.tag }}
+  prev_tag:
+    description: Previous tag
+    value: ${{ steps.tag.outputs.prev_tag }}
+  skipped:
+    description: "'true' if no new commits since prev_tag"
+    value: ${{ steps.diff.outputs.skipped }}
+  commit_hash:
+    description: SHA of the tagged commit
+    value: ${{ steps.finalize.outputs.commit_hash }}
+  tag_pushed_at:
+    description: ISO timestamp of the tag push
+    value: ${{ steps.finalize.outputs.tag_pushed_at }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate input
+      shell: bash
+      run: |
+        case "${{ inputs.type }}" in
+          prerelease|release) ;;
+          *) echo "::error::invalid type '${{ inputs.type }}' (expected prerelease|release)"; exit 1 ;;
+        esac
+
+    - name: Configure git identity
+      shell: bash
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+    - name: Compute next tag
+      id: tag
+      uses: ./.github/actions/create-tag
+      with:
+        type: ${{ inputs.type }}
+
+    - name: Check for new commits
+      id: diff
+      shell: bash
+      env:
+        PREV_TAG: ${{ steps.tag.outputs.prev_tag }}
+      run: |
+        set -euo pipefail
+        if [[ "$PREV_TAG" == "none" ]]; then
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+          echo "commit_count=$(git rev-list --count HEAD)" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        count=$(git rev-list --count "${PREV_TAG}..HEAD")
+        if [[ "$count" -eq 0 ]]; then
+          echo "::notice::no new commits since $PREV_TAG — skipping release"
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+        fi
+        echo "commit_count=$count" >> "$GITHUB_OUTPUT"
+
+    - name: Verify hotfixes are present in HEAD
+      if: ${{ inputs.type == 'prerelease' && steps.diff.outputs.skipped != 'true' && steps.tag.outputs.hotfix_tags != '' }}
+      shell: bash
+      env:
+        HOTFIX_TAGS: ${{ steps.tag.outputs.hotfix_tags }}
+        BASE_PROD: ${{ steps.tag.outputs.base_prod_tag }}
+      run: |
+        set -euo pipefail
+        missing=()
+        for hfx in $HOTFIX_TAGS; do
+          # git cherry lists commits present in one ref but not the other.
+          # A "+" prefix means the commit is missing from HEAD.
+          if git cherry HEAD "$hfx" "$BASE_PROD" 2>/dev/null | grep -q '^+ '; then
+            missing+=("$hfx")
+          fi
+        done
+        if (( ${#missing[@]} > 0 )); then
+          printf '::error::hotfix tags missing commits in HEAD: %s\n' "${missing[*]}"
+          exit 1
+        fi
+
+    - name: Resolve RC source commit (release only)
+      id: release-source
+      if: ${{ inputs.type == 'release' && steps.diff.outputs.skipped != 'true' }}
+      shell: bash
+      env:
+        RC_TAG: ${{ steps.tag.outputs.rc_tag }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$RC_TAG" ]]; then
+          echo "::error::missing RC tag for release"; exit 1
+        fi
+        sha=$(git rev-parse "$RC_TAG^{commit}")
+        echo "commit=$sha" >> "$GITHUB_OUTPUT"
+
+    - name: Build release notes
+      id: notes
+      if: ${{ steps.diff.outputs.skipped != 'true' }}
+      shell: bash
+      env:
+        PREV_TAG: ${{ steps.tag.outputs.prev_tag }}
+        NEW_TAG: ${{ steps.tag.outputs.tag }}
+      run: |
+        set -euo pipefail
+        if [[ "$PREV_TAG" == "none" ]]; then
+          range="HEAD"
+        else
+          range="${PREV_TAG}..HEAD"
+        fi
+        {
+          echo "notes<<__EOF__"
+          git log --no-merges --pretty=format:'- %s (%h)' "$range" | head -n 100
+          echo
+          echo "__EOF__"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Push tag & create release
+      id: finalize
+      if: ${{ steps.diff.outputs.skipped != 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        NEW_TAG: ${{ steps.tag.outputs.tag }}
+        TAG_TYPE: ${{ inputs.type }}
+        RC_COMMIT: ${{ steps.release-source.outputs.commit }}
+        REPO: ${{ inputs.repository }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        NOTES: ${{ steps.notes.outputs.notes }}
+      run: |
+        set -euo pipefail
+        pushed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+        if [[ "$TAG_TYPE" == "prerelease" ]]; then
+          commit=$(git rev-parse HEAD)
+        else
+          commit="$RC_COMMIT"
+        fi
+
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "::notice::[dry-run] would tag $NEW_TAG at $commit and create a $TAG_TYPE GitHub Release"
+        else
+          if [[ "$TAG_TYPE" == "prerelease" ]]; then
+            # Tag HEAD, push it, and create a prerelease GitHub Release
+            git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+            git push origin "refs/tags/$NEW_TAG"
+            gh release create "$NEW_TAG" \
+              --repo "$REPO" \
+              --title "$NEW_TAG" \
+              --notes "$NOTES" \
+              --prerelease \
+              --target "$commit"
+          else
+            # Release: DRAFT release targeting the RC commit — tag is created when the draft is published
+            gh release create "$NEW_TAG" \
+              --repo "$REPO" \
+              --title "$NEW_TAG" \
+              --notes "$NOTES" \
+              --draft \
+              --target "$commit"
+          fi
+        fi
+
+        echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+        echo "commit_hash=$commit" >> "$GITHUB_OUTPUT"
+        echo "tag_pushed_at=$pushed_at" >> "$GITHUB_OUTPUT"
+
+    - name: Notify Slack
+      if: ${{ steps.diff.outputs.skipped != 'true' && inputs.dry-run != 'true' }}
+      uses: ./.github/actions/notify-slack
+      with:
+        slack-token: ${{ inputs.slack-token }}
+        channel-id: ${{ inputs.channel-id }}
+        title: ${{ inputs.type == 'prerelease' && format('🧪 Prerelease {0}', steps.finalize.outputs.tag) || format('📝 Release draft {0}', steps.finalize.outputs.tag) }}
+        body: |
+          *${{ inputs.repository }}* → `${{ steps.finalize.outputs.tag }}`
+          Commit: `${{ steps.finalize.outputs.commit_hash }}`
+          Previous: `${{ steps.tag.outputs.prev_tag }}`
+        url: https://github.com/${{ inputs.repository }}/releases/tag/${{ steps.finalize.outputs.tag }}

@@ -1,0 +1,89 @@
+name: Notify Slack
+description: Post a Block-Kit formatted message to a Slack channel.
+
+inputs:
+  slack-token:
+    description: Slack bot token (xoxb-...)
+    required: true
+  channel-id:
+    description: Target channel ID
+    required: true
+  title:
+    description: Message header
+    required: true
+  body:
+    description: Message body (supports Slack mrkdwn)
+    required: true
+  url:
+    description: Optional URL rendered as a button
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        SLACK_TOKEN: ${{ inputs.slack-token }}
+        CHANNEL_ID: ${{ inputs.channel-id }}
+        TITLE: ${{ inputs.title }}
+        BODY: ${{ inputs.body }}
+      run: |
+        : "${SLACK_TOKEN:?slack-token is required}"
+        : "${CHANNEL_ID:?channel-id is required}"
+        : "${TITLE:?title is required}"
+        : "${BODY:?body is required}"
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install @slack/web-api
+      shell: bash
+      run: npm install --no-save --silent @slack/web-api@7
+
+    - name: Post Slack message
+      shell: bash
+      env:
+        SLACK_TOKEN: ${{ inputs.slack-token }}
+        CHANNEL_ID: ${{ inputs.channel-id }}
+        TITLE: ${{ inputs.title }}
+        BODY: ${{ inputs.body }}
+        URL: ${{ inputs.url }}
+      run: |
+        node <<'JS'
+        const { WebClient } = require('@slack/web-api')
+        const { SLACK_TOKEN, CHANNEL_ID, TITLE, BODY, URL } = process.env
+
+        const blocks = [
+          { type: 'header', text: { type: 'plain_text', text: TITLE, emoji: true } },
+          { type: 'section', text: { type: 'mrkdwn', text: BODY } },
+        ]
+
+        if (URL && URL.trim()) {
+          blocks.push({
+            type: 'actions',
+            elements: [{
+              type: 'button',
+              text: { type: 'plain_text', text: 'Open' },
+              url: URL.trim(),
+              style: 'primary',
+            }],
+          })
+        }
+
+        ;(async () => {
+          const client = new WebClient(SLACK_TOKEN)
+          const res = await client.chat.postMessage({
+            channel: CHANNEL_ID,
+            text: TITLE,
+            blocks,
+          })
+          if (!res.ok) {
+            console.error('Slack API error:', res.error)
+            process.exit(1)
+          }
+          console.log(`Posted to ${CHANNEL_ID} (ts=${res.ts})`)
+        })().catch(err => { console.error(err); process.exit(1) })
+        JS
