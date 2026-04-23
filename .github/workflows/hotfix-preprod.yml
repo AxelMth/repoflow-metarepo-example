@@ -52,12 +52,13 @@ jobs:
           pnpm --silent repoflow list --json > /tmp/repos.json
           REPO_NAME="$REPO_NAME" node --input-type=module - <<'JS' > /tmp/lookup.json
           import fs from 'node:fs'
-          const all = JSON.parse(fs.readFileSync('/tmp/repos.json', 'utf8'))
+          const cfg = JSON.parse(fs.readFileSync('/tmp/repos.json', 'utf8'))
+          const all = Array.isArray(cfg) ? cfg : (cfg.repos ?? [])
           const name = process.env.REPO_NAME
           const hit = all.find(r => r.name === name)
           if (!hit) { console.error(`unknown repo: ${name}`); process.exit(1) }
           if (!hit.preprodWorkflow) { console.error(`repo ${name} has no preprodWorkflow configured`); process.exit(1) }
-          const m = /github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?/.exec(hit.url)
+          const m = /github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/.exec(hit.url)
           if (!m) { console.error(`cannot parse owner/repo from ${hit.url}`); process.exit(1) }
           process.stdout.write(JSON.stringify({ fullName: m[1], workflow: hit.preprodWorkflow }))
           JS

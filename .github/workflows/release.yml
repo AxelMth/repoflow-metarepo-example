@@ -51,7 +51,8 @@ jobs:
 
           matrix=$(REPOS="$REPOS" node --input-type=module - <<'JS'
           import fs from 'node:fs'
-          const all = JSON.parse(fs.readFileSync('/tmp/repos.json', 'utf8'))
+          const cfg = JSON.parse(fs.readFileSync('/tmp/repos.json', 'utf8'))
+          const all = Array.isArray(cfg) ? cfg : (cfg.repos ?? [])
           const filter = (process.env.REPOS || 'all').trim()
           const wanted = filter === 'all'
             ? null
@@ -61,7 +62,7 @@ jobs:
             .filter(r => !wanted || wanted.has(r.name))
             .filter(r => r.prodWorkflow)
             .map(r => {
-              const m = /github\.com[:/]([^/]+\/[^/.]+)(?:\.git)?/.exec(r.url)
+              const m = /github\.com[:/]([^/]+\/[^/.]+?)(?:\.git)?$/.exec(r.url)
               if (!m) throw new Error(`cannot parse owner/repo from ${r.url}`)
               return { name: r.name, fullName: m[1], workflow: r.prodWorkflow }
             })
