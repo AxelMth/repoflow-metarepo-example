@@ -96,39 +96,35 @@ pnpm test      # test all child repos
 pnpm lint      # lint all child repos
 ```
 
-## Release workflows
+## Release workflow
 
-This meta-repo also ships a set of **production-grade release workflows** that run against each child repo from a single place. They rely on two optional fields in `repoflow.config.ts`:
+This meta-repo also ships a **production-grade release workflow** that runs against each child repo from a single place. It relies on one optional field in `repoflow.config.ts`:
 
 ```ts
 {
   name: 'api',
   url: 'https://github.com/axelmth/repoflow-example-api.git',
-  preprodWorkflow: 'deploy-preprod.yml', // workflow triggered on RC tag
-  prodWorkflow: 'deploy-prod.yml',       // workflow triggered on stable tag
+  prodWorkflow: 'deploy-prod.yml', // workflow triggered on stable tag
 }
 ```
 
-`preprodWorkflow` and `prodWorkflow` are **optional**. `sync`, `status` and `doctor` don't need them — only the release workflows do.
+`prodWorkflow` is **optional**. `sync`, `status` and `doctor` don't need it — only the release workflow does.
 
-### The 4 workflows
+### The workflow
 
 | Workflow | When to use | How to trigger | What it does |
 |---|---|---|---|
-| **Prerelease** | Daily snapshot to preprod | Cron (07:20 Paris, weekdays) or `Actions → Prerelease → Run workflow` | • Computes next `-rc.N` tag per repo<br>• Pushes tag + creates a **prerelease** on GitHub<br>• Waits for each child's preprod deploy workflow |
-| **Release** | Promote RC to prod | `Actions → Release → Run workflow` | • Strips `-rc.N` from latest RC<br>• Creates a **DRAFT** GitHub Release targeting the RC's commit<br>• Human review + publish triggers the prod deploy |
-| **Hotfix preprod** | Patch an active RC | `Actions → Hotfix preprod → Run workflow` with `repo` + `commit` | • Computes `hotfix-rc` tag<br>• Creates `rc/<tag>` branch, cherry-picks the commit<br>• Pushes tag + prerelease |
-| **Hotfix prod** | Patch production | `Actions → Hotfix prod → Run workflow` with `repo` + `commit` | • Computes patch tag from latest prod<br>• Creates `hotfix/<tag>` branch, cherry-picks<br>• Pushes tag + stable release |
+| **Release** | Ship to prod | `Actions → Release → Run workflow` | • Bumps minor from latest prod tag<br>• Creates a **DRAFT** GitHub Release targeting `HEAD`<br>• Human review + publish triggers the prod deploy |
 
-Each workflow accepts a `dry-run` input that skips pushes, releases, and Slack posts — useful when testing a new child repo.
+The workflow accepts a `dry-run` input that skips releases and Slack posts — useful when testing a new child repo.
 
 ### 2-level pipeline
 
 The design separates **tagging** (owned by this meta-repo) from **deployment** (owned by each child repo):
 
-1. The meta-repo pushes a tag to the child repo.
-2. The child repo's own workflow (e.g. `deploy-preprod.yml`) is triggered by that tag push and handles the actual build + deploy.
-3. The meta-repo waits for that workflow to complete before moving on (`scripts/wait-for-workflows.sh`).
+1. The meta-repo creates a **draft** GitHub Release on the child repo, targeting `HEAD`.
+2. A human reviews and publishes the draft — GitHub creates the tag at that moment.
+3. The child repo's own workflow (e.g. `deploy-prod.yml`) is triggered by the tag push and handles the actual build + deploy.
 
 This keeps each child repo self-contained (it knows how to deploy itself) while centralizing tag/changelog/Slack orchestration. <TODO: link to talk slides once available>
 
@@ -157,9 +153,7 @@ Each folder has its own README with inputs, outputs, and usage.
 
 - **Swap the notification transport** (Teams, Discord, email…) — replace the inline Node script in `.github/actions/notify-slack/action.yml`. Keep the same inputs and no workflow needs to change.
 - **Different tag prefix** — pass `tag-prefix` to `create-tag` (defaults to `v`).
-- **Different cron schedule** — edit the `cron:` line in `prerelease.yml`.
-- **Filter which repos get prereleased** — trigger the workflow manually with `repos: web,api` (comma-separated).
-- **Skip the deploy-wait** — remove the `wait-for-deployments` job from the workflow, or extend `scripts/wait-for-workflows.sh` to match your own naming.
+- **Filter which repos get released** — trigger the workflow manually with `repos: web,api` (comma-separated).
 
 ## Troubleshooting
 

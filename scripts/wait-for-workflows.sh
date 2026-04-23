@@ -5,7 +5,7 @@
 # a tag push) completes. Exit 0 on success, 1 if any run failed or timed out.
 #
 # Input: JSON array as $1. Entries look like:
-#   [{ "repo": "owner/api", "tag": "v1.3.0", "workflow": "deploy-preprod.yml",
+#   [{ "repo": "owner/api", "tag": "v1.3.0", "workflow": "deploy-prod.yml",
 #      "commitSha": "abc123", "tagPushedAt": "2026-04-21T07:20:00Z" }]
 #
 # Requires: gh CLI (authenticated via GITHUB_TOKEN or GIT_PAT) + jq
@@ -33,8 +33,11 @@ TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-1200}
 POLL_INTERVAL=${POLL_INTERVAL:-15}
 deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
 
-# Parse the JSON array into a list of pipe-separated rows
-mapfile -t ENTRIES < <(jq -rc '.[] | [.repo, .tag, .workflow, .commitSha, .tagPushedAt] | @tsv' <<<"$INPUT")
+# Parse the JSON array into a list of tab-separated rows (portable, avoids mapfile)
+ENTRIES=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && ENTRIES+=("$line")
+done < <(jq -rc '.[] | [.repo, .tag, .workflow, .commitSha, .tagPushedAt] | @tsv' <<<"$INPUT")
 
 if (( ${#ENTRIES[@]} == 0 )); then
   echo "nothing to wait for"
